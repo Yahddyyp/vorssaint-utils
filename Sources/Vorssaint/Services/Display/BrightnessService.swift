@@ -469,22 +469,50 @@ final class BrightnessService: ObservableObject {
 
     private func syncKeyboardBrightnessHotkeys() {
         let enabled = AppFeature.brightness.isAvailable
-            && UserDefaults.standard.bool(forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled)
+            && UserDefaults.standard.bool(
+                forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled
+            )
             && keyboardLightBridge != nil
-        let decreaseShortcut = GlobalShortcutRole.keyboardBrightnessDecrease.savedShortcut
-        let increaseShortcut = GlobalShortcutRole.keyboardBrightnessIncrease.savedShortcut
-        let decreaseConflicts = enabled && decreaseShortcut.conflictsWithSystemShortcut
-            && !SystemShortcutTakeover.isTakenOver(GlobalShortcutRole.keyboardBrightnessDecrease.storageKey)
-        let increaseConflicts = enabled && increaseShortcut.conflictsWithSystemShortcut
-            && !SystemShortcutTakeover.isTakenOver(GlobalShortcutRole.keyboardBrightnessIncrease.storageKey)
+
+        let useCarbonFallback = enabled && !AXIsProcessTrusted()
+
+        let decreaseShortcut =
+            GlobalShortcutRole.keyboardBrightnessDecrease.savedShortcut
+
+        let increaseShortcut =
+            GlobalShortcutRole.keyboardBrightnessIncrease.savedShortcut
+
+        let decreaseConflicts =
+            useCarbonFallback
+            && decreaseShortcut.conflictsWithSystemShortcut
+            && !SystemShortcutTakeover.isTakenOver(
+                GlobalShortcutRole.keyboardBrightnessDecrease.storageKey
+            )
+
+        let increaseConflicts =
+            useCarbonFallback
+            && increaseShortcut.conflictsWithSystemShortcut
+            && !SystemShortcutTakeover.isTakenOver(
+                GlobalShortcutRole.keyboardBrightnessIncrease.storageKey
+            )
+
         let decreaseRegistered = keyboardBrightnessDecreaseHotkey.sync(
-            enabled: enabled && !decreaseConflicts, shortcut: decreaseShortcut,
-            storageKey: GlobalShortcutRole.keyboardBrightnessDecrease.storageKey)
+            enabled: useCarbonFallback && !decreaseConflicts,
+            shortcut: decreaseShortcut,
+            storageKey: GlobalShortcutRole.keyboardBrightnessDecrease.storageKey
+        )
+
         let increaseRegistered = keyboardBrightnessIncreaseHotkey.sync(
-            enabled: enabled && !increaseConflicts, shortcut: increaseShortcut,
-            storageKey: GlobalShortcutRole.keyboardBrightnessIncrease.storageKey)
-        keyboardBrightnessShortcutRegistrationFailed = decreaseConflicts || increaseConflicts
-            || !(decreaseRegistered && increaseRegistered)
+            enabled: useCarbonFallback && !increaseConflicts,
+            shortcut: increaseShortcut,
+            storageKey: GlobalShortcutRole.keyboardBrightnessIncrease.storageKey
+        )
+
+        keyboardBrightnessShortcutRegistrationFailed =
+            useCarbonFallback
+            && (decreaseConflicts
+                || increaseConflicts
+                || !(decreaseRegistered && increaseRegistered))
     }
 
     private func start() {
@@ -996,19 +1024,40 @@ final class BrightnessService: ObservableObject {
         // keystroke tap is only earned when this app answers a brightness key
         // instead of the system: the pointer decides the target, or an overlay
         // or the island stands in for the system's own.
-        if wanted, running, BrightnessSupport.answersPlainBrightnessKeys(followsPointer: wantsKeyRouting,
-                                                                          overlayReplacesNative: wantsBrightnessOSD) {
+        let wantsKeyboardBrightnessShortcuts =
+            running
+            && UserDefaults.standard.bool(
+                forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled
+            )
+            && keyboardLightBridge != nil
+            && AXIsProcessTrusted()
+
+        let wantsPlainBrightnessKeys =
+            wanted
+            && running
+            && BrightnessSupport.answersPlainBrightnessKeys(
+                followsPointer: wantsKeyRouting,
+                overlayReplacesNative: wantsBrightnessOSD
+            )
+
+        if wantsPlainBrightnessKeys || wantsKeyboardBrightnessShortcuts {
             let hotKeys = UserDefaults(suiteName: "com.apple.symbolichotkeys")?
                 .dictionary(forKey: "AppleSymbolicHotKeys")
-            let adjusts = BrightnessSupport.functionKeysAdjustBrightness(symbolicHotKeys: hotKeys)
+
+            let adjusts = BrightnessSupport.functionKeysAdjustBrightness(
+                symbolicHotKeys: hotKeys
+            )
+
             let overlayReplaces = wantsBrightnessOSD
             let systemTarget = systemKeyTarget?.id
+
             keyThreadLock.withLock {
                 functionKeysAdjustBrightness = adjusts
                 overlayReplacesNativeOSD = overlayReplaces
                 functionKeysFollowPointer = wantsKeyRouting
                 functionKeySystemTarget = systemTarget
             }
+
             installFunctionKeyTap()
         } else {
             removeFunctionKeyTap()
@@ -1174,10 +1223,9 @@ final class BrightnessService: ObservableObject {
     }
 
     /// Runs on the tap thread. The window server holds every keystroke in the
-    /// session until this returns, so anything that is not one of the four
-    /// brightness codes leaves immediately, and nothing here reads state that
-    /// belongs to the main thread: the target display comes from the display
-    /// server and the route from behind the state lock.
+    /// session until this returns, so unrelated keys leave immediately. The
+    /// keyboard backlight shortcuts are handled here as ordinary
+    /// key events so native key repeat can drive repeated brightness steps.
     private func routeFunctionKey(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             let shouldSync = keyThreadLock.withLock { () -> Bool in
@@ -1203,9 +1251,50 @@ final class BrightnessService: ObservableObject {
             return Unmanaged.passUnretained(event)
         }
         let keyCode = Int(event.getIntegerValueField(.keyboardEventKeycode))
+
+        // These are ordinary keyboard keys, so handle them here instead of
+        // BrightnessSupport.isBrightnessKeyCode()
+        if UserDefaults.standard.bool(
+            forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled
+        ) {
+            let decreaseShortcut =
+                GlobalShortcutRole.keyboardBrightnessDecrease.savedShortcut
+
+            let increaseShortcut =
+                GlobalShortcutRole.keyboardBrightnessIncrease.savedShortcut
+
+            let isDecrease = decreaseShortcut.matches(event: event)
+            let isIncrease = increaseShortcut.matches(event: event)
+
+            if isDecrease || isIncrease {
+                if type == .keyUp {
+                    keyThreadLock.withLock {
+                        _ = swallowedKeyCodes.remove(keyCode)
+                    }
+
+                    return nil
+                }
+
+                let direction = isDecrease ? -1 : 1
+
+                // This runs for the initial keyDown and every native
+                // autorepeat keyDown generated by macOS
+                DispatchQueue.main.async { [weak self] in
+                    self?.stepKeyboardLight(direction: direction)
+                }
+
+                keyThreadLock.withLock {
+                    _ = swallowedKeyCodes.insert(keyCode)
+                }
+
+                return nil
+            }
+        }
+
         guard BrightnessSupport.isBrightnessKeyCode(keyCode) else {
             return Unmanaged.passUnretained(event)
         }
+
         // A release is consumed only when its press was, so the system never
         // receives half a key.
         guard type == .keyDown else {
