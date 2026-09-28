@@ -142,6 +142,10 @@ final class BrightnessService: ObservableObject {
     /// Codes whose press this app consumed, so the matching release is
     /// consumed as well and the system never sees half a key.
     private var swallowedKeyCodes = Set<Int>()
+    private var keyboardBrightnessDecreaseAllowed = false
+    private var keyboardBrightnessIncreaseAllowed = false
+    private var keyboardBrightnessDecreaseTapClaimed = false
+    private var keyboardBrightnessIncreaseTapClaimed = false
     /// Serializes every I2C transaction and rebuild; DDC displays drop
     /// commands that interleave.
     private let workQueue = DispatchQueue(label: "com.vorssaint.utils.brightness", qos: .userInitiated)
@@ -482,37 +486,86 @@ final class BrightnessService: ObservableObject {
         let increaseShortcut =
             GlobalShortcutRole.keyboardBrightnessIncrease.savedShortcut
 
+        let decreaseKey =
+            GlobalShortcutRole.keyboardBrightnessDecrease.storageKey
+
+        let increaseKey =
+            GlobalShortcutRole.keyboardBrightnessIncrease.storageKey
+
         let decreaseConflicts =
-            useCarbonFallback
-            && decreaseShortcut.conflictsWithSystemShortcut
-            && !SystemShortcutTakeover.isTakenOver(
-                GlobalShortcutRole.keyboardBrightnessDecrease.storageKey
-            )
+            decreaseShortcut.conflictsWithSystemShortcut
+            && !SystemShortcutTakeover.isTakenOver(decreaseKey)
 
         let increaseConflicts =
-            useCarbonFallback
-            && increaseShortcut.conflictsWithSystemShortcut
-            && !SystemShortcutTakeover.isTakenOver(
-                GlobalShortcutRole.keyboardBrightnessIncrease.storageKey
-            )
+            increaseShortcut.conflictsWithSystemShortcut
+            && !SystemShortcutTakeover.isTakenOver(increaseKey)
+
+        keyThreadLock.withLock {
+            keyboardBrightnessDecreaseAllowed =
+                enabled && !decreaseConflicts
+            keyboardBrightnessIncreaseAllowed =
+                enabled && !increaseConflicts
+        }
+
+        // The event-tap path owns its takeover claims separately from Carbon
+        // Release those claims whenever the tap is no longer responsible for
+        // handling the shortcut.
+        if useCarbonFallback || !enabled {
+            if keyboardBrightnessDecreaseTapClaimed {
+                SystemShortcutTakeover.release(decreaseKey)
+                keyboardBrightnessDecreaseTapClaimed = false
+            }
+
+            if keyboardBrightnessIncreaseTapClaimed {
+                SystemShortcutTakeover.release(increaseKey)
+                keyboardBrightnessIncreaseTapClaimed = false
+            }
+        } else {
+            if decreaseConflicts {
+                if keyboardBrightnessDecreaseTapClaimed {
+                    SystemShortcutTakeover.release(decreaseKey)
+                    keyboardBrightnessDecreaseTapClaimed = false
+                }
+            } else {
+                SystemShortcutTakeover.claim(
+                    decreaseKey,
+                    shortcut: decreaseShortcut
+                )
+                keyboardBrightnessDecreaseTapClaimed = true
+            }
+
+            if increaseConflicts {
+                if keyboardBrightnessIncreaseTapClaimed {
+                    SystemShortcutTakeover.release(increaseKey)
+                    keyboardBrightnessIncreaseTapClaimed = false
+                }
+            } else {
+                SystemShortcutTakeover.claim(
+                    increaseKey,
+                    shortcut: increaseShortcut
+                )
+                keyboardBrightnessIncreaseTapClaimed = true
+            }
+        }
 
         let decreaseRegistered = keyboardBrightnessDecreaseHotkey.sync(
             enabled: useCarbonFallback && !decreaseConflicts,
             shortcut: decreaseShortcut,
-            storageKey: GlobalShortcutRole.keyboardBrightnessDecrease.storageKey
+            storageKey: decreaseKey
         )
 
         let increaseRegistered = keyboardBrightnessIncreaseHotkey.sync(
             enabled: useCarbonFallback && !increaseConflicts,
             shortcut: increaseShortcut,
-            storageKey: GlobalShortcutRole.keyboardBrightnessIncrease.storageKey
+            storageKey: increaseKey
         )
 
         keyboardBrightnessShortcutRegistrationFailed =
-            useCarbonFallback
+            enabled
             && (decreaseConflicts
                 || increaseConflicts
-                || !(decreaseRegistered && increaseRegistered))
+                || (useCarbonFallback
+                    && !(decreaseRegistered && increaseRegistered)))
     }
 
     private func start() {
@@ -1025,12 +1078,12 @@ final class BrightnessService: ObservableObject {
         // instead of the system: the pointer decides the target, or an overlay
         // or the island stands in for the system's own.
         let wantsKeyboardBrightnessShortcuts =
-            running
-            && UserDefaults.standard.bool(
+            UserDefaults.standard.bool(
                 forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled
             )
             && keyboardLightBridge != nil
             && AXIsProcessTrusted()
+            && SessionActivity.shared.isActive
 
         let wantsPlainBrightnessKeys =
             wanted
@@ -1252,43 +1305,52 @@ final class BrightnessService: ObservableObject {
         }
         let keyCode = Int(event.getIntegerValueField(.keyboardEventKeycode))
 
-        // These are ordinary keyboard keys, so handle them here instead of
-        // BrightnessSupport.isBrightnessKeyCode()
-        if UserDefaults.standard.bool(
-            forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled
-        ) {
-            let decreaseShortcut =
-                GlobalShortcutRole.keyboardBrightnessDecrease.savedShortcut
+        // Releases must be paired with presses that this tap actually consumed.
+        // Check this before matching the current shortcut because modifier state
+        // may have changed since the original keyDown.
+        if type == .keyUp {
+            let consumed = keyThreadLock.withLock {
+                swallowedKeyCodes.remove(keyCode) != nil
+            }
 
-            let increaseShortcut =
-                GlobalShortcutRole.keyboardBrightnessIncrease.savedShortcut
-
-            let isDecrease = decreaseShortcut.matches(event: event)
-            let isIncrease = increaseShortcut.matches(event: event)
-
-            if isDecrease || isIncrease {
-                if type == .keyUp {
-                    keyThreadLock.withLock {
-                        _ = swallowedKeyCodes.remove(keyCode)
-                    }
-
-                    return nil
-                }
-
-                let direction = isDecrease ? -1 : 1
-
-                // This runs for the initial keyDown and every native
-                // autorepeat keyDown generated by macOS
-                DispatchQueue.main.async { [weak self] in
-                    self?.stepKeyboardLight(direction: direction)
-                }
-
-                keyThreadLock.withLock {
-                    _ = swallowedKeyCodes.insert(keyCode)
-                }
-
+            if consumed {
                 return nil
             }
+        }
+
+        // Only consume shortcuts that passed the conflict/takeover checks in
+        // syncKeyboardBrightnessHotkeys()
+        let decreaseShortcut =
+            GlobalShortcutRole.keyboardBrightnessDecrease.savedShortcut
+
+        let increaseShortcut =
+            GlobalShortcutRole.keyboardBrightnessIncrease.savedShortcut
+
+        let (decreaseAllowed, increaseAllowed) = keyThreadLock.withLock {
+            (
+                keyboardBrightnessDecreaseAllowed,
+                keyboardBrightnessIncreaseAllowed
+            )
+        }
+
+        let isDecrease =
+            decreaseAllowed && decreaseShortcut.matches(event: event)
+
+        let isIncrease =
+            increaseAllowed && increaseShortcut.matches(event: event)
+
+        if isDecrease || isIncrease {
+            let direction = isDecrease ? -1 : 1
+
+            DispatchQueue.main.async { [weak self] in
+                self?.stepKeyboardLight(direction: direction)
+            }
+
+            keyThreadLock.withLock {
+                _ = swallowedKeyCodes.insert(keyCode)
+            }
+
+            return nil
         }
 
         guard BrightnessSupport.isBrightnessKeyCode(keyCode) else {
