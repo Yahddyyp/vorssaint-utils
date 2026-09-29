@@ -480,6 +480,14 @@ final class BrightnessService: ObservableObject {
 
         let useCarbonFallback = enabled && !AXIsProcessTrusted()
 
+        // Accessibility being trusted means the tap should own the shortcut,
+        // but the tap is created asynchronously. Wait until it actually
+        // exists before treating it as the active shortcut owner.
+        let tapShouldOwn = enabled && !useCarbonFallback
+        let tapIsRunning = keyThreadLock.withLock {
+            functionKeyTap != nil
+        }
+
         let decreaseShortcut =
             GlobalShortcutRole.keyboardBrightnessDecrease.savedShortcut
 
@@ -502,50 +510,32 @@ final class BrightnessService: ObservableObject {
 
         keyThreadLock.withLock {
             keyboardBrightnessDecreaseAllowed =
-                enabled && !decreaseConflicts
+                enabled
+                && !decreaseConflicts
+                && (useCarbonFallback || tapIsRunning)
             keyboardBrightnessIncreaseAllowed =
-                enabled && !increaseConflicts
+                enabled
+                && !increaseConflicts
+                && (useCarbonFallback || tapIsRunning)
         }
 
-        // The event-tap path owns its takeover claims separately from Carbon
-        // Release those claims whenever the tap is no longer responsible for
-        // handling the shortcut.
-        if useCarbonFallback || !enabled {
-            if keyboardBrightnessDecreaseTapClaimed {
-                SystemShortcutTakeover.release(decreaseKey)
-                keyboardBrightnessDecreaseTapClaimed = false
-            }
+        // Transfer ownership in two phases. When moving from the tap to
+        // Carbon, release the tap claim before Carbon registers. When moving
+        // from Carbon to the tap, let Carbon unregister first, then claim
+        // from the tap so Carbon's teardown cannot release the new claim.
+        let decreaseTapOwns =
+            tapShouldOwn && tapIsRunning && !decreaseConflicts
+        let increaseTapOwns =
+            tapShouldOwn && tapIsRunning && !increaseConflicts
 
-            if keyboardBrightnessIncreaseTapClaimed {
-                SystemShortcutTakeover.release(increaseKey)
-                keyboardBrightnessIncreaseTapClaimed = false
-            }
-        } else {
-            if decreaseConflicts {
-                if keyboardBrightnessDecreaseTapClaimed {
-                    SystemShortcutTakeover.release(decreaseKey)
-                    keyboardBrightnessDecreaseTapClaimed = false
-                }
-            } else {
-                SystemShortcutTakeover.claim(
-                    decreaseKey,
-                    shortcut: decreaseShortcut
-                )
-                keyboardBrightnessDecreaseTapClaimed = true
-            }
+        if !decreaseTapOwns, keyboardBrightnessDecreaseTapClaimed {
+            SystemShortcutTakeover.release(decreaseKey)
+            keyboardBrightnessDecreaseTapClaimed = false
+        }
 
-            if increaseConflicts {
-                if keyboardBrightnessIncreaseTapClaimed {
-                    SystemShortcutTakeover.release(increaseKey)
-                    keyboardBrightnessIncreaseTapClaimed = false
-                }
-            } else {
-                SystemShortcutTakeover.claim(
-                    increaseKey,
-                    shortcut: increaseShortcut
-                )
-                keyboardBrightnessIncreaseTapClaimed = true
-            }
+        if !increaseTapOwns, keyboardBrightnessIncreaseTapClaimed {
+            SystemShortcutTakeover.release(increaseKey)
+            keyboardBrightnessIncreaseTapClaimed = false
         }
 
         let decreaseRegistered = keyboardBrightnessDecreaseHotkey.sync(
@@ -560,12 +550,29 @@ final class BrightnessService: ObservableObject {
             storageKey: increaseKey
         )
 
+        if decreaseTapOwns {
+            SystemShortcutTakeover.claim(
+                decreaseKey,
+                shortcut: decreaseShortcut
+            )
+            keyboardBrightnessDecreaseTapClaimed = true
+        }
+
+        if increaseTapOwns {
+            SystemShortcutTakeover.claim(
+                increaseKey,
+                shortcut: increaseShortcut
+            )
+            keyboardBrightnessIncreaseTapClaimed = true
+        }
+
         keyboardBrightnessShortcutRegistrationFailed =
             enabled
             && (decreaseConflicts
                 || increaseConflicts
                 || (useCarbonFallback
-                    && !(decreaseRegistered && increaseRegistered)))
+                    && !(decreaseRegistered && increaseRegistered))
+                || (tapShouldOwn && !tapIsRunning))
     }
 
     private func start() {
@@ -1078,7 +1085,8 @@ final class BrightnessService: ObservableObject {
         // instead of the system: the pointer decides the target, or an overlay
         // or the island stands in for the system's own.
         let wantsKeyboardBrightnessShortcuts =
-            UserDefaults.standard.bool(
+            AppFeature.brightness.isAvailable
+            && UserDefaults.standard.bool(
                 forKey: DefaultsKey.keyboardBrightnessShortcutsEnabled
             )
             && keyboardLightBridge != nil
@@ -1244,10 +1252,16 @@ final class BrightnessService: ObservableObject {
                 userInfo: Unmanaged.passUnretained(self).toOpaque()
             ) else {
                 _ = clearFunctionKeyThread()
+                DispatchQueue.main.async { [weak self] in
+                    self?.syncKeyboardBrightnessHotkeys()
+                }
                 return
             }
             let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
             keyThreadLock.withLock { functionKeyTap = tap }
+            DispatchQueue.main.async { [weak self] in
+                self?.syncKeyboardBrightnessHotkeys()
+            }
             CFRunLoopAddSource(runLoop, source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
             if keyThreadLock.withLock({ shouldStopFunctionKeyThread }) {
@@ -1313,9 +1327,13 @@ final class BrightnessService: ObservableObject {
                 swallowedKeyCodes.remove(keyCode) != nil
             }
 
-            if consumed {
-                return nil
-            }
+            return consumed
+                ? nil
+                : Unmanaged.passUnretained(event)
+        }
+
+        guard !ShortcutCapture.isCapturing else {
+            return Unmanaged.passUnretained(event)
         }
 
         // Only consume shortcuts that passed the conflict/takeover checks in
