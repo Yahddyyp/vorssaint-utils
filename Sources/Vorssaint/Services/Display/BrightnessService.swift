@@ -147,8 +147,8 @@ final class BrightnessService: ObservableObject {
     private var swallowedKeyCodes = Set<Int>()
     private var keyboardBrightnessDecreaseAllowed = false
     private var keyboardBrightnessIncreaseAllowed = false
-    private var keyboardBrightnessDecreaseTapClaimed = false
-    private var keyboardBrightnessIncreaseTapClaimed = false
+    private var keyboardBrightnessDecreaseTapClaimed: GlobalShortcut?
+    private var keyboardBrightnessIncreaseTapClaimed: GlobalShortcut?
     /// Serializes every I2C transaction and rebuild; DDC displays drop
     /// commands that interleave.
     private let workQueue = DispatchQueue(label: "com.vorssaint.utils.brightness", qos: .userInitiated)
@@ -538,14 +538,30 @@ final class BrightnessService: ObservableObject {
         let increaseTapOwns =
             tapShouldOwn && tapIsRunning && !increaseConflicts
 
-        if !decreaseTapOwns, keyboardBrightnessDecreaseTapClaimed {
-            SystemShortcutTakeover.release(decreaseKey)
-            keyboardBrightnessDecreaseTapClaimed = false
+        if !decreaseTapOwns {
+            if keyboardBrightnessDecreaseTapClaimed != nil {
+                SystemShortcutTakeover.release(decreaseKey)
+                keyboardBrightnessDecreaseTapClaimed = nil
+            }
+        } else if keyboardBrightnessDecreaseTapClaimed != decreaseShortcut {
+            SystemShortcutTakeover.claim(
+                decreaseKey,
+                shortcut: decreaseShortcut
+            )
+            keyboardBrightnessDecreaseTapClaimed = decreaseShortcut
         }
 
-        if !increaseTapOwns, keyboardBrightnessIncreaseTapClaimed {
-            SystemShortcutTakeover.release(increaseKey)
-            keyboardBrightnessIncreaseTapClaimed = false
+        if !increaseTapOwns {
+            if keyboardBrightnessIncreaseTapClaimed != nil {
+                SystemShortcutTakeover.release(increaseKey)
+                keyboardBrightnessIncreaseTapClaimed = nil
+            }
+        } else if keyboardBrightnessIncreaseTapClaimed != increaseShortcut {
+            SystemShortcutTakeover.claim(
+                increaseKey,
+                shortcut: increaseShortcut
+            )
+            keyboardBrightnessIncreaseTapClaimed = increaseShortcut
         }
 
         let decreaseRegistered = keyboardBrightnessDecreaseHotkey.sync(
@@ -559,22 +575,6 @@ final class BrightnessService: ObservableObject {
             shortcut: increaseShortcut,
             storageKey: increaseKey
         )
-
-        if decreaseTapOwns && !keyboardBrightnessDecreaseTapClaimed {
-            SystemShortcutTakeover.claim(
-                decreaseKey,
-                shortcut: decreaseShortcut
-            )
-            keyboardBrightnessDecreaseTapClaimed = true
-        }
-
-        if increaseTapOwns && !keyboardBrightnessIncreaseTapClaimed {
-            SystemShortcutTakeover.claim(
-                increaseKey,
-                shortcut: increaseShortcut
-            )
-            keyboardBrightnessIncreaseTapClaimed = true
-        }
 
         keyboardBrightnessShortcutRegistrationFailed =
             enabled
